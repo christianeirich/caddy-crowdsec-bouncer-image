@@ -5,76 +5,127 @@ on:
     branches: [main]
   schedule:
     - cron: '3 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+  security-events: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-main
   cancel-in-progress: true
 
 jobs:
-  check-and-build:
+  build-and-scan:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
-      - name: fetch-remote-digest
-        id: digest
+      - name: Determine runtime digest & plugin commit
+        id: versions
+        shell: bash
         run: |
-          remote=$(docker manifest inspect --verbose caddy:2-alpine | jq -r 'if type=="array" then .[0].Descriptor.digest else .Descriptor.digest end')
-          echo "remote=$remote" >>"$GITHUB_OUTPUT"
+          set -euo pipefail
+          runtime=$(docker manifest inspect --verbose caddy:2-alpine | jq -r 'if type=="array" then .[0].Descriptor.digest else .Descriptor.digest end')
+          plugin=$(git ls-remote https://github.com/hslatman/caddy-crowdsec-bouncer.git refs/heads/main | cut -f1)
+          dfhash=$(sha256sum Dockerfile | cut -d' ' -f1)
+          echo "runtime=$runtime" >>"$GITHUB_OUTPUT"
+          echo "plugin=$plugin" >>"$GITHUB_OUTPUT"
+          echo "dockerfile_hash=$dfhash" >>"$GITHUB_OUTPUT"
 
-      - name: restore-last-digest
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: last_digest.txt
-          key: digest-${{ runner.os }}-${{ steps.digest.outputs.remote }}
-          restore-keys: digest-${{ runner.os }}-
-
-      - name: compare-digest
-        id: changed
+      - name: Compute key tag
+        id: key
         run: |
-          if [[ -f last_digest.txt && "$(cat last_digest.txt)" == "${{ steps.digest.outputs.remote }}" ]]; then
-            echo "changed=false" >>"$GITHUB_OUTPUT"
+          set -euo pipefail
+          key="${{ steps.versions.outputs.runtime }}-${{ steps.versions.outputs.plugin }}-${{ steps.versions.outputs.dockerfile_hash }}"
+          echo "tag=base-$(echo -n "$key" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if current base/plugin build already exists
+        id: exists
+        run: |
+          set -euo pipefail
+          if docker manifest inspect ghcr.io/${{ github.repository_owner }}/caddy-crowdsec-bouncer-image:${{ steps.key.outputs.tag }} >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "changed=true" >>"$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: setup-buildx
-        if: steps.changed.outputs.changed == 'true'
-        uses: docker/setup-buildx-action@v3
+      - name: Enable QEMU for multi‑arch build
+        if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-qemu-action@v3.2.0
 
-      - name: login-ghcr
-        if: steps.changed.outputs.changed == 'true'
-        uses: docker/login-action@v3
+      - name: Initialize Docker Buildx builder
+        if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3.7.1
+
+      - name: Generate image metadata
+        if: steps.exists.outputs.skip == 'false'
+        id: meta
+        uses: docker/metadata-action@v5.7.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/caddy-crowdsec-bouncer-image
+          tags: |
+            type=raw,value=latest
+            type=sha
+            type=raw,value=${{ steps.key.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=Caddy with CrowdSec HTTP Bouncer
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Authenticate to GHCR registry
+        if: steps.exists.outputs.skip == 'false'
+        uses: docker/login-action@v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: build-and-push
-        if: steps.changed.outputs.changed == 'true'
-        uses: docker/build-push-action@v5
+      - name: Build & push multi‑arch image
+        if: steps.exists.outputs.skip == 'false'
+        id: build
+        uses: docker/build-push-action@v6.10.0
         with:
           context: .
           file: Dockerfile
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/caddy-crowdsec-bouncer-image:latest
-            ghcr.io/${{ github.repository_owner }}/caddy-crowdsec-bouncer-image:${{ github.sha }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CADDY_VERSION=2
+            CROWDSEC_BOUNCER_REF=${{ steps.versions.outputs.plugin }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: mode=max,inline-only=true
 
-      - name: save-new-digest
-        if: steps.changed.outputs.changed == 'true'
-        run: echo "${{ steps.digest.outputs.remote }}" > last_digest.txt
-
-      - name: cache-new-digest
-        if: steps.changed.outputs.changed == 'true'
-        uses: actions/cache@v4
+      - name: Attest build provenance
+        if: steps.exists.outputs.skip == 'false'
+        uses: actions/attest-build-provenance@v1.4.3
         with:
-          path: last_digest.txt
-          key: digest-${{ runner.os }}-${{ steps.digest.outputs.remote }}
+          subject-name: ghcr.io/${{ github.repository_owner }}/caddy-crowdsec-bouncer-image
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install Trivy scanner
+        if: steps.exists.outputs.skip == 'false'
+        uses: aquasecurity/setup-trivy@v0.2.4
+
+      - name: Scan published image with Trivy
+        if: steps.exists.outputs.skip == 'false'
+        run: |
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-results.sarif \
+            ghcr.io/${{ github.repository_owner }}/caddy-crowdsec-bouncer-image@${{ steps.build.outputs.digest }}
+
+      - name: Upload SARIF report to GitHub Code Scanning
+        if: steps.exists.outputs.skip == 'false'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
